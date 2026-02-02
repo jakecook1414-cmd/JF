@@ -111,6 +111,67 @@ def run_calibration(series, horizon_days, lookback_days, n_paths, model):
 def run_factors(asset, factors, start_date, end_date, min_obs):
     return run_factor_regression(asset, factors, start_date, end_date, min_obs=min_obs)
 
+METRIC_HELP = {
+    "cagr": "CAGR: annualized growth rate of the strategy. Higher is generally better.",
+    "max_drawdown": "Max drawdown: largest peak-to-trough loss. Smaller (less negative) is better.",
+    "vol": "Volatility: annualized return variability. Lower means smoother, but can imply lower returns.",
+    "sharpe": "Sharpe: return per unit of volatility. Higher is better; >1 is often good.",
+    "win_rate": "Win rate: % of positive return days/trades. Higher is better, but not the only metric.",
+    "turnover": "Turnover: how often positions change. Lower means fewer trades and costs.",
+    "trades": "Trades: number of position changes in the period.",
+    "coverage_80": "Coverage (80% band): how often realized prices fell within the 80% forecast band.",
+    "coverage_90": "Coverage (90% band): how often realized prices fell within the 90% forecast band.",
+    "alpha": "Alpha: return not explained by factors. Positive is good, but not guaranteed.",
+    "r2": "R²: fraction of returns explained by the factors. Higher means more explained.",
+}
+
+
+def metric_with_help(label, value, key, delta=None):
+    st.metric(label, value, delta=delta, help=METRIC_HELP.get(key, ""))
+
+
+def metrics_help_expander(keys):
+    with st.expander("What these metrics mean", expanded=False):
+        for key in keys:
+            text = METRIC_HELP.get(key)
+            if text:
+                st.caption(text)
+
+
+def backtest_metrics_from_returns(returns: pd.Series, positions: pd.Series) -> dict:
+    if returns.empty:
+        return {
+            "cagr": 0.0,
+            "max_drawdown": 0.0,
+            "vol": 0.0,
+            "sharpe": 0.0,
+            "win_rate": 0.0,
+            "turnover": 0.0,
+            "trades": 0,
+        }
+    equity = (1 + returns).cumprod()
+    total_days = max(len(returns), 1)
+    years = total_days / 252
+    cagr = float(equity.iloc[-1] ** (1 / years) - 1) if years > 0 else 0.0
+    peak = equity.cummax()
+    drawdown = (equity / peak) - 1.0
+    max_drawdown = float(drawdown.min())
+    vol = float(returns.std() * np.sqrt(252))
+    sharpe = float((returns.mean() / returns.std()) * np.sqrt(252)) if returns.std() > 0 else 0.0
+    nonzero = returns[returns != 0]
+    win_rate = float((nonzero > 0).mean()) if len(nonzero) > 0 else 0.0
+    turnover = float(positions.diff().abs().sum() / max(len(positions), 1))
+    trades = int((positions.diff().abs() > 0).sum())
+    return {
+        "cagr": cagr,
+        "max_drawdown": max_drawdown,
+        "vol": vol,
+        "sharpe": sharpe,
+        "win_rate": win_rate,
+        "turnover": turnover,
+        "trades": trades,
+    }
+
 def build_ai_snapshot(watch_df, positions_df, range_label, factor_summary):
     watch = watch_df.reset_index().rename(columns={"index": "ticker"})
     watch = watch[["ticker", "Price", "Day Change ($)", "Day Change (%)", f"Return ({range_label}) %"]]
@@ -377,6 +438,27 @@ with alerts_tab:
 
 with quant_tab:
     st.subheader("Quant Toolkit")
+    intent = st.radio(
+        "What do you want to answer today?",
+        [
+            "What could the price be by X date? (Forecast)",
+            "Would this strategy have worked historically? (Backtest)",
+            "Is my forecast model trustworthy? (Validation/Calibration)",
+            "What drives this ticker? (Factors/Exposures)",
+        ],
+        horizontal=False,
+    )
+    beginner_mode = st.toggle("Beginner mode", value=True)
+
+    st.info(
+        "Assumptions & limitations\n"
+        "- Uses historical distributions; does not know future news/earnings\n"
+        "- Assumes execution at close (or next bar) as modeled\n"
+        "- Slippage is ignored unless explicitly set\n"
+        "- Outputs are scenarios, not guarantees\n"
+        "- Model fit does not imply causal drivers\n"
+    )
+
     qc1, qc2, qc3 = st.columns(3)
     qticker = qc1.selectbox("Ticker", data_tickers, index=0, key="quant_ticker")
     default_start = (datetime.today() - timedelta(days=365 * 5)).date()
@@ -391,17 +473,57 @@ with quant_tab:
         if series.empty:
             st.warning("Not enough data for the selected range.")
 
+    st.caption("Use the tabs below or follow the guided flow based on your selected question.")
+    intent_map = {
+        "What could the price be by X date? (Forecast)": "Forecast",
+        "Would this strategy have worked historically? (Backtest)": "Backtest",
+        "Is my forecast model trustworthy? (Validation/Calibration)": "Validation",
+        "What drives this ticker? (Factors/Exposures)": "Factors",
+    }
+    st.info(f"Suggested tab: **{intent_map.get(intent, 'Forecast')}**")
     forecast_tab, backtest_tab, validation_tab, factors_tab, ai_tab = st.tabs(
         ["Forecast", "Backtest", "Validation", "Factors", "AI"]
     )
 
     with forecast_tab:
-        st.subheader("Forecast Cones (Distribution)")
-        horizon = st.selectbox("Horizon (trading days)", [5, 20, 60, 120], index=1)
-        model = st.selectbox("Model", ["bootstrap", "regime"], index=0)
-        n_paths = st.slider("Paths", min_value=2000, max_value=20000, step=1000, value=10000)
+        st.subheader("Forecast: What could the price be by X date?")
+        preset = st.selectbox(
+            "Preset",
+            ["Swing (20d)", "Position (60d)", "Longer-term (120d)", "Custom"],
+            index=0,
+            key="forecast_preset",
+        )
+        preset_map = {
+            "Swing (20d)": {"horizon": 20, "paths": 10000, "model": "bootstrap"},
+            "Position (60d)": {"horizon": 60, "paths": 10000, "model": "bootstrap"},
+            "Longer-term (120d)": {"horizon": 120, "paths": 20000, "model": "regime"},
+        }
+        if preset in preset_map:
+            st.session_state["forecast_horizon"] = preset_map[preset]["horizon"]
+            st.session_state["forecast_paths"] = preset_map[preset]["paths"]
+            st.session_state["forecast_model"] = preset_map[preset]["model"]
+        horizon = st.selectbox(
+            "Horizon (trading days)",
+            [5, 20, 60, 120],
+            index=1,
+            key="forecast_horizon",
+        )
         last_price = float(series.iloc[-1]) if not series.empty else 0.0
         target = st.number_input("Target price", min_value=0.0, step=1.0, value=last_price)
+
+        if beginner_mode:
+            model = st.session_state.get("forecast_model", "bootstrap")
+            n_paths = st.session_state.get("forecast_paths", 10000)
+            with st.expander("Advanced settings", expanded=False):
+                model = st.selectbox("Model", ["bootstrap", "regime"], index=0, key="forecast_model")
+                n_paths = st.slider(
+                    "Paths", min_value=2000, max_value=20000, step=1000, value=10000, key="forecast_paths"
+                )
+        else:
+            model = st.selectbox("Model", ["bootstrap", "regime"], index=0, key="forecast_model")
+            n_paths = st.slider(
+                "Paths", min_value=2000, max_value=20000, step=1000, value=10000, key="forecast_paths"
+            )
 
         if series.empty:
             st.caption("Load a ticker and date range to run forecasts.")
@@ -411,52 +533,101 @@ with quant_tab:
                 st.warning("Not enough data to run simulation.")
             else:
                 percentiles = terminal_percentiles(terminal)
-                pct_df = pd.DataFrame({
-                    "Percentile": list(percentiles.keys()),
-                    "Price": list(percentiles.values()),
-                })
-                st.dataframe(pct_df, use_container_width=True)
+                p25 = percentiles.get(25, 0.0)
+                p75 = percentiles.get(75, 0.0)
+                p10 = float(np.percentile(terminal, 10))
+                p90 = float(np.percentile(terminal, 90))
+                p5 = percentiles.get(5, 0.0)
+                p95 = percentiles.get(95, 0.0)
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Expected range (P25–P75)", f"{p25:.2f} – {p75:.2f}")
+                c2.metric("Conservative range (P10–P90)", f"{p10:.2f} – {p90:.2f}")
+                if not beginner_mode:
+                    c3.metric("Tail range (P5–P95)", f"{p5:.2f} – {p95:.2f}")
+                else:
+                    with c3:
+                        with st.expander("Tail range (P5–P95)"):
+                            st.write(f"{p5:.2f} – {p95:.2f}")
 
                 prob_current = prob_above(terminal, float(series.iloc[-1]))
                 prob_target = prob_above(terminal, float(target))
-
                 st.metric("P(terminal > current)", f"{prob_current*100:.1f}%")
                 st.metric("P(terminal > target)", f"{prob_target*100:.1f}%")
 
-                st.caption("Fan chart (percentile bands + sample paths)")
+                dates = pd.bdate_range(start=series.index[-1], periods=len(paths[0]))
+                p10_series = np.percentile(paths, 10, axis=0)
+                p50_series = np.percentile(paths, 50, axis=0)
+                p90_series = np.percentile(paths, 90, axis=0)
+
+                st.caption("Forecast fan chart (calendar dates)")
                 fig3 = plt.figure()
-                sample_paths = paths[:100]
-                plt.plot(sample_paths.T, color="steelblue", alpha=0.05)
-                pcts = np.percentile(paths, [5, 25, 50, 75, 95], axis=0)
-                for i, p in enumerate([5, 25, 50, 75, 95]):
-                    plt.plot(pcts[i], label=f"P{p}")
-                plt.title(f"{qticker} Forecast Cone ({horizon}d)")
-                plt.xlabel("Day")
+                plt.fill_between(dates, p10_series, p90_series, color="#6baed6", alpha=0.25, label="P10–P90")
+                plt.plot(dates, p50_series, color="#08519c", label="P50")
+                plt.title(f"{qticker} Forecast ({horizon} trading days)")
+                plt.xlabel("Date")
                 plt.ylabel("Price")
                 plt.legend()
                 st.pyplot(fig3, clear_figure=True)
 
-    with backtest_tab:
-        st.subheader("Backtest (No Lookahead + Walk-forward)")
-        strategy = st.selectbox("Strategy", ["SMA Crossover", "Time-series Momentum"], index=0)
-        cost_bps = st.number_input("Transaction cost (bps)", min_value=0.0, step=1.0, value=5.0)
-        slippage_bps = st.number_input("Slippage (bps)", min_value=0.0, step=1.0, value=2.0)
+                st.caption("Terminal distribution at horizon")
+                figh = plt.figure()
+                plt.hist(terminal, bins=50, color="steelblue", alpha=0.7)
+                plt.axvline(p50, color="black", linewidth=1, label="P50")
+                plt.axvline(p10, color="gray", linestyle="--", linewidth=1, label="P10/P90")
+                plt.axvline(p90, color="gray", linestyle="--", linewidth=1)
+                plt.legend()
+                plt.xlabel("Terminal price")
+                plt.ylabel("Frequency")
+                st.pyplot(figh, clear_figure=True)
 
+    with backtest_tab:
+        st.subheader("Backtest: Would this strategy have worked historically?")
+        preset = st.selectbox(
+            "Preset",
+            ["SMA 50/200", "Momentum 252d", "Custom"],
+            index=0,
+            key="backtest_preset",
+        )
+        if preset == "SMA 50/200":
+            st.session_state["bt_strategy"] = "SMA Crossover"
+            st.session_state["bt_fast"] = 50
+            st.session_state["bt_slow"] = 200
+        elif preset == "Momentum 252d":
+            st.session_state["bt_strategy"] = "Time-series Momentum"
+            st.session_state["bt_lookback"] = 252
+
+        strategy = st.selectbox("Strategy", ["SMA Crossover", "Time-series Momentum"], index=0, key="bt_strategy")
         params = {}
         signal_fn = sma_crossover_signal
         if strategy == "SMA Crossover":
-            fast = st.number_input("Fast SMA", min_value=5, step=5, value=50)
-            slow = st.number_input("Slow SMA", min_value=20, step=10, value=200)
+            fast = st.number_input("Fast SMA", min_value=5, step=5, value=50, key="bt_fast")
+            slow = st.number_input("Slow SMA", min_value=20, step=10, value=200, key="bt_slow")
             params = {"fast": int(fast), "slow": int(slow)}
             signal_fn = sma_crossover_signal
         else:
-            lookback = st.number_input("Lookback (trading days)", min_value=20, step=10, value=252)
+            lookback = st.number_input("Lookback (trading days)", min_value=20, step=10, value=252, key="bt_lookback")
             params = {"lookback": int(lookback)}
             signal_fn = momentum_signal
 
-        train_days = st.number_input("Train days", min_value=252, step=126, value=756)
-        test_days = st.number_input("Test days", min_value=21, step=21, value=126)
-        step_days = st.number_input("Step days", min_value=21, step=21, value=126)
+        if beginner_mode:
+            cost_bps = 5.0
+            slippage_bps = 2.0
+            train_days = 756
+            test_days = 126
+            step_days = 126
+            with st.expander("Advanced settings", expanded=False):
+                cost_bps = st.number_input("Transaction cost (bps)", min_value=0.0, step=1.0, value=5.0)
+                slippage_bps = st.number_input("Slippage (bps)", min_value=0.0, step=1.0, value=2.0)
+                train_days = st.number_input("Train days", min_value=252, step=126, value=756)
+                test_days = st.number_input("Test days", min_value=21, step=21, value=126)
+                step_days = st.number_input("Step days", min_value=21, step=21, value=126)
+        else:
+            cost_bps = st.number_input("Transaction cost (bps)", min_value=0.0, step=1.0, value=5.0)
+            slippage_bps = st.number_input("Slippage (bps)", min_value=0.0, step=1.0, value=2.0)
+            train_days = st.number_input("Train days", min_value=252, step=126, value=756)
+            test_days = st.number_input("Test days", min_value=21, step=21, value=126)
+            step_days = st.number_input("Step days", min_value=21, step=21, value=126)
 
         if series.empty:
             st.caption("Load a ticker and date range to run backtests.")
@@ -472,42 +643,66 @@ with quant_tab:
                 **params,
             )
 
-            st.subheader("Segment Metrics")
-            if not wf.segment_metrics.empty:
-                st.dataframe(wf.segment_metrics, use_container_width=True, height=240)
-            else:
-                st.caption("Not enough history for walk-forward segments.")
+            st.subheader("Overall Metrics (Walk-forward)")
+            mcols = st.columns(4)
+            with mcols[0]:
+                metric_with_help("CAGR", f"{wf.overall_metrics.get('cagr', 0.0)*100:.2f}%", "cagr")
+            with mcols[1]:
+                metric_with_help("Max Drawdown", f"{wf.overall_metrics.get('max_drawdown', 0.0)*100:.2f}%", "max_drawdown")
+            with mcols[2]:
+                metric_with_help("Vol", f"{wf.overall_metrics.get('vol', 0.0)*100:.2f}%", "vol")
+            with mcols[3]:
+                metric_with_help("Sharpe", f"{wf.overall_metrics.get('sharpe', 0.0):.2f}", "sharpe")
+            mcols2 = st.columns(3)
+            with mcols2[0]:
+                metric_with_help("Win Rate", f"{wf.overall_metrics.get('win_rate', 0.0)*100:.1f}%", "win_rate")
+            with mcols2[1]:
+                metric_with_help("Turnover", f"{wf.overall_metrics.get('turnover', 0.0):.2f}", "turnover")
+            with mcols2[2]:
+                metric_with_help("Trades", f"{int(wf.overall_metrics.get('trades', 0))}", "trades")
 
-            st.subheader("Overall Metrics")
-            st.metric("CAGR", f"{wf.overall_metrics.get('cagr', 0.0)*100:.2f}%")
-            st.metric("Max Drawdown", f"{wf.overall_metrics.get('max_drawdown', 0.0)*100:.2f}%")
-            st.metric("Vol", f"{wf.overall_metrics.get('vol', 0.0)*100:.2f}%")
-            st.metric("Sharpe", f"{wf.overall_metrics.get('sharpe', 0.0):.2f}")
-            st.metric("Win Rate", f"{wf.overall_metrics.get('win_rate', 0.0)*100:.1f}%")
-            st.metric("Turnover", f"{wf.overall_metrics.get('turnover', 0.0):.2f}")
-            st.metric("Trades", f"{int(wf.overall_metrics.get('trades', 0))}")
+            metrics_help_expander(["cagr", "max_drawdown", "vol", "sharpe", "win_rate", "turnover", "trades"])
 
-            st.subheader("Equity Curve (Walk-forward)")
-            if not wf.equity_curve.empty:
-                fig4 = plt.figure()
-                plt.plot(wf.equity_curve.index, wf.equity_curve.values)
-                plt.xlabel("Date")
-                plt.ylabel("Equity")
-                plt.title("Walk-forward Equity")
-                st.pyplot(fig4, clear_figure=True)
-
-            st.subheader("Full-period Backtest")
             full = run_backtest(series, signal_fn, cost_bps=float(cost_bps), slippage_bps=float(slippage_bps), **params)
             if not full.equity_curve.empty:
-                fig5 = plt.figure()
-                plt.plot(full.equity_curve.index, full.equity_curve.values)
+                daily_ret = series.pct_change().fillna(0)
+                bench_equity = (1 + daily_ret).cumprod()
+                st.subheader("Equity Curve vs Buy-and-Hold")
+                fig4 = plt.figure()
+                plt.plot(full.equity_curve.index, full.equity_curve.values, label="Strategy")
+                plt.plot(bench_equity.index, bench_equity.values, label="Buy & Hold", linestyle="--")
                 plt.xlabel("Date")
                 plt.ylabel("Equity")
-                plt.title("Full-period Equity")
-                st.pyplot(fig5, clear_figure=True)
+                plt.legend()
+                st.pyplot(fig4, clear_figure=True)
+
+                bench_metrics = backtest_metrics_from_returns(daily_ret, pd.Series(1, index=daily_ret.index))
+                st.caption("Benchmark: Buy-and-Hold (same ticker)")
+                bcols = st.columns(4)
+                bcols[0].metric("CAGR", f"{bench_metrics.get('cagr', 0.0)*100:.2f}%")
+                bcols[1].metric("Max Drawdown", f"{bench_metrics.get('max_drawdown', 0.0)*100:.2f}%")
+                bcols[2].metric("Vol", f"{bench_metrics.get('vol', 0.0)*100:.2f}%")
+                bcols[3].metric("Sharpe", f"{bench_metrics.get('sharpe', 0.0):.2f}")
+
+            if beginner_mode:
+                with st.expander("Detailed walk-forward segments", expanded=False):
+                    if not wf.segment_metrics.empty:
+                        st.dataframe(wf.segment_metrics, use_container_width=True, height=240)
+                    else:
+                        st.caption("Not enough history for walk-forward segments.")
+            else:
+                st.subheader("Segment Metrics")
+                if not wf.segment_metrics.empty:
+                    st.dataframe(wf.segment_metrics, use_container_width=True, height=240)
+                else:
+                    st.caption("Not enough history for walk-forward segments.")
 
     with validation_tab:
         st.subheader("Calibration & Diagnostics")
+        st.caption(
+            "Coverage measures how often realized prices fall inside forecast bands. "
+            "If an 80% band only captures ~60% of outcomes, the model is overconfident."
+        )
         calib_model = st.selectbox("Model", ["bootstrap", "regime"], index=0, key="calib_model")
         horizon_days = st.selectbox("Horizon (trading days)", [5, 20, 60, 120], index=1, key="calib_horizon")
         calib_paths = st.number_input("Paths per window", min_value=500, step=500, value=2000)
@@ -522,63 +717,90 @@ with quant_tab:
                     st.warning("Not enough history for calibration.")
                 else:
                     cov = coverage_summary(calib)
-                    st.metric("Coverage 80% band (P10–P90)", f"{cov['cov_10_90']*100:.1f}%")
-                    st.metric("Coverage 90% band (P5–P95)", f"{cov['cov_5_95']*100:.1f}%")
+                    metric_with_help(
+                        "Coverage 80% band (P10–P90)",
+                        f"{cov['cov_10_90']*100:.1f}%",
+                        "coverage_80",
+                    )
+                    metric_with_help(
+                        "Coverage 90% band (P5–P95)",
+                        f"{cov['cov_5_95']*100:.1f}%",
+                        "coverage_90",
+                    )
+                    metrics_help_expander(["coverage_80", "coverage_90"])
 
-                    figc = plt.figure()
-                    plt.plot(calib["date"], calib["future"], label="Realized")
-                    plt.plot(calib["date"], calib["p10"], label="P10", linestyle="--")
-                    plt.plot(calib["date"], calib["p90"], label="P90", linestyle="--")
-                    plt.plot(calib["date"], calib["p5"], label="P5", linestyle=":")
-                    plt.plot(calib["date"], calib["p95"], label="P95", linestyle=":")
-                    plt.legend()
-                    plt.xlabel("Date")
-                    plt.ylabel("Price")
-                    st.pyplot(figc, clear_figure=True)
+                    cov_ok = abs(cov["cov_10_90"] - 0.8) <= 0.1 and abs(cov["cov_5_95"] - 0.9) <= 0.1
+                    cue = "OK" if cov_ok else "Needs tuning"
+                    st.metric("Model confidence cue", cue)
 
-                    figcov = plt.figure()
-                    cov_80 = calib["in_10_90"].rolling(20).mean()
-                    cov_90 = calib["in_5_95"].rolling(20).mean()
-                    plt.plot(calib["date"], cov_80, label="Rolling 20D coverage 80% band")
-                    plt.plot(calib["date"], cov_90, label="Rolling 20D coverage 90% band")
-                    plt.axhline(0.8, color="gray", linestyle="--", linewidth=1)
-                    plt.axhline(0.9, color="gray", linestyle=":", linewidth=1)
-                    plt.legend()
-                    plt.xlabel("Date")
-                    plt.ylabel("Coverage")
-                    st.pyplot(figcov, clear_figure=True)
+                    def render_validation_charts():
+                        figc = plt.figure()
+                        plt.plot(calib["date"], calib["future"], label="Realized")
+                        plt.plot(calib["date"], calib["p10"], label="P10", linestyle="--")
+                        plt.plot(calib["date"], calib["p90"], label="P90", linestyle="--")
+                        plt.plot(calib["date"], calib["p5"], label="P5", linestyle=":")
+                        plt.plot(calib["date"], calib["p95"], label="P95", linestyle=":")
+                        plt.legend()
+                        plt.xlabel("Date")
+                        plt.ylabel("Price")
+                        st.pyplot(figc, clear_figure=True)
+
+                        figcov = plt.figure()
+                        cov_80 = calib["in_10_90"].rolling(20).mean()
+                        cov_90 = calib["in_5_95"].rolling(20).mean()
+                        plt.plot(calib["date"], cov_80, label="Rolling 20D coverage 80% band")
+                        plt.plot(calib["date"], cov_90, label="Rolling 20D coverage 90% band")
+                        plt.axhline(0.8, color="gray", linestyle="--", linewidth=1)
+                        plt.axhline(0.9, color="gray", linestyle=":", linewidth=1)
+                        plt.legend()
+                        plt.xlabel("Date")
+                        plt.ylabel("Coverage")
+                        st.pyplot(figcov, clear_figure=True)
+
+                    if beginner_mode:
+                        with st.expander("Detailed calibration charts", expanded=False):
+                            render_validation_charts()
+                    else:
+                        render_validation_charts()
 
             st.subheader("Diagnostics")
             vol20 = realized_volatility(series, 20)
             vol60 = realized_volatility(series, 60)
-            if not vol20.empty and not vol60.empty:
-                figv = plt.figure()
-                plt.plot(vol20.index, vol20.values, label="20D Vol")
-                plt.plot(vol60.index, vol60.values, label="60D Vol")
-                plt.legend()
-                plt.xlabel("Date")
-                plt.ylabel("Vol (annualized)")
-                st.pyplot(figv, clear_figure=True)
+            def render_diagnostics():
+                if not vol20.empty and not vol60.empty:
+                    figv = plt.figure()
+                    plt.plot(vol20.index, vol20.values, label="20D Vol")
+                    plt.plot(vol60.index, vol60.values, label="60D Vol")
+                    plt.legend()
+                    plt.xlabel("Date")
+                    plt.ylabel("Vol (annualized)")
+                    st.pyplot(figv, clear_figure=True)
 
-            rets, _ = returns_distribution(series)
-            if rets.size > 0:
-                figh = plt.figure()
-                plt.hist(rets, bins=50, color="steelblue", alpha=0.7)
-                plt.xlabel("Daily Return")
-                plt.ylabel("Frequency")
-                st.pyplot(figh, clear_figure=True)
+                rets, _ = returns_distribution(series)
+                if rets.size > 0:
+                    figh = plt.figure()
+                    plt.hist(rets, bins=50, color="steelblue", alpha=0.7)
+                    plt.xlabel("Daily Return")
+                    plt.ylabel("Frequency")
+                    st.pyplot(figh, clear_figure=True)
 
-            dd = drawdown_curve(series)
-            if not dd.empty:
-                figd = plt.figure()
-                plt.plot(dd.index, dd.values, color="firebrick")
-                plt.xlabel("Date")
-                plt.ylabel("Drawdown")
-                st.pyplot(figd, clear_figure=True)
+                dd = drawdown_curve(series)
+                if not dd.empty:
+                    figd = plt.figure()
+                    plt.plot(dd.index, dd.values, color="firebrick")
+                    plt.xlabel("Date")
+                    plt.ylabel("Drawdown")
+                    st.pyplot(figd, clear_figure=True)
+
+            if beginner_mode:
+                with st.expander("Diagnostics (advanced)", expanded=False):
+                    render_diagnostics()
+            else:
+                render_diagnostics()
 
     with factors_tab:
         st.subheader("Factor Regression (OLS)")
-        st.caption("Uses ETF factor proxies from Yahoo Finance. Beta/alpha are daily unless noted.")
+        st.caption("Uses ETF factor proxies from Yahoo Finance. Betas are daily. Exposure ≠ causation.")
         fc1, fc2 = st.columns([1.2, 0.8])
         factor_text = fc1.text_input(
             "Factor tickers (comma-separated)",
@@ -611,20 +833,44 @@ with quant_tab:
                         ).to_dict(orient="records"),
                     }
                     mc1, mc2, mc3, mc4 = st.columns(4)
-                    mc1.metric("R²", f"{metrics.get('r2', 0.0):.3f}")
-                    mc2.metric("Adj R²", f"{metrics.get('adj_r2', 0.0):.3f}")
-                    mc3.metric("Alpha (annual)", f"{metrics.get('alpha_annual', 0.0)*100:.2f}%")
-                    mc4.metric("Info Ratio", f"{metrics.get('info_ratio', 0.0):.2f}")
+                    with mc1:
+                        metric_with_help("R²", f"{metrics.get('r2', 0.0):.3f}", "r2")
+                    with mc2:
+                        st.metric("Adj R²", f"{metrics.get('adj_r2', 0.0):.3f}")
+                    with mc3:
+                        metric_with_help("Alpha (annual)", f"{metrics.get('alpha_annual', 0.0)*100:.2f}%", "alpha")
+                    with mc4:
+                        st.metric("Info Ratio", f"{metrics.get('info_ratio', 0.0):.2f}")
 
                     coeffs = result.coefficients.copy()
                     if "const" in coeffs.index:
                         coeffs = coeffs.rename(index={"const": "alpha"})
-                    st.subheader("Coefficients")
-                    st.dataframe(
-                        coeffs.style.format({"coef": "{:.4f}", "t_stat": "{:.2f}", "p_value": "{:.4f}"}),
-                        use_container_width=True,
-                        height=240,
-                    )
+                    coeff_rows = coeffs.reset_index().rename(columns={"index": "factor"})
+                    exposure_lines = []
+                    for _, row in coeff_rows.iterrows():
+                        factor = row["factor"]
+                        if factor == "alpha":
+                            continue
+                        exposure_lines.append(f"{factor}: ~{row['coef']*100:.0f}% sensitivity")
+                    if exposure_lines:
+                        st.subheader("Plain-language exposures")
+                        st.caption("Approximate sensitivities based on historical co-movement.")
+                        st.write(" • " + "\n • ".join(exposure_lines))
+
+                    if beginner_mode:
+                        with st.expander("Full coefficients table", expanded=False):
+                            st.dataframe(
+                                coeffs.style.format({"coef": "{:.4f}", "t_stat": "{:.2f}", "p_value": "{:.4f}"}),
+                                use_container_width=True,
+                                height=240,
+                            )
+                    else:
+                        st.subheader("Coefficients")
+                        st.dataframe(
+                            coeffs.style.format({"coef": "{:.4f}", "t_stat": "{:.2f}", "p_value": "{:.4f}"}),
+                            use_container_width=True,
+                            height=240,
+                        )
 
                     st.subheader("Actual vs Fitted (Cumulative)")
                     data = result.data.copy()

@@ -17,19 +17,31 @@ python -m streamlit run app.py
 ## Quant Toolkit
 Open the **Quant** tab in the Streamlit app for the professional-grade quant suite.
 
+**New UX (Question-led)**
+- Intent selector to route you to Forecast, Backtest, Validation, or Factors
+- Beginner / Advanced mode toggle
+- Presets for Forecast and Backtest to reduce setup time
+- Always-visible assumptions & limitations block
+
 **Forecast**
-- Bootstrap or Regime bootstrap forecast cones
-- Percentile bands, terminal distribution stats
+- Calendar-date fan chart (P10/P50/P90)
+- Terminal distribution histogram at horizon
+- Expected / Conservative / Tail ranges
 - P(terminal > current) and P(terminal > target)
 
 **Backtest**
 - SMA Crossover and Time-series Momentum
 - Walk-forward evaluation (train/test/step windows)
-- Transaction cost + slippage bps
+- Benchmark comparison vs buy-and-hold
+- Transaction cost + slippage bps (advanced)
 
 **Validation**
 - Calibration report for forecast cones (coverage for 80%/90% bands)
+- Model confidence cue + coverage explanation
 - Diagnostics: realized volatility (20D/60D), return histogram, drawdown curve
+
+**Factors**
+- Factor regression outputs with plain-language exposures
 
 ## Dependencies
 Key packages (see `requirements.txt` for full list):
