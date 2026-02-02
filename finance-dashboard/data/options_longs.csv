@@ -1,0 +1,2 @@
+position_id,ticker,type,expiry,strike,contracts,entry_price,open_date,notes
+LONG001,AAPL,call,2026-03-20,200,1,3.20,2026-02-01,Sample long call

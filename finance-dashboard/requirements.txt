@@ -1,0 +1,12 @@
+streamlit
+pandas
+yfinance
+matplotlib
+numpy
+exchange_calendars
+statsmodels
+arch
+empyrical
+quantstats
+py_vollib
+vectorbt

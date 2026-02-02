@@ -1,0 +1,20 @@
+[
+  {
+    "id": "049344b4",
+    "ticker": "TSLA",
+    "type": "price_above",
+    "value": 440.0,
+    "enabled": true,
+    "cooldown_minutes": 60,
+    "last_triggered": ""
+  },
+  {
+    "id": "c8fd6fc1",
+    "ticker": "NVDA",
+    "type": "price_above",
+    "value": 193.0,
+    "enabled": true,
+    "cooldown_minutes": 60,
+    "last_triggered": ""
+  }
+]
