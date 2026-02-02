@@ -535,6 +535,7 @@ with quant_tab:
                 percentiles = terminal_percentiles(terminal)
                 p25 = percentiles.get(25, 0.0)
                 p75 = percentiles.get(75, 0.0)
+                p50 = percentiles.get(50, float(np.percentile(terminal, 50)))
                 p10 = float(np.percentile(terminal, 10))
                 p90 = float(np.percentile(terminal, 90))
                 p5 = percentiles.get(5, 0.0)
