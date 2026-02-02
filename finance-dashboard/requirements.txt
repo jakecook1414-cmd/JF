@@ -10,3 +10,5 @@ empyrical
 quantstats
 py_vollib
 vectorbt
+openai
+python-dotenv

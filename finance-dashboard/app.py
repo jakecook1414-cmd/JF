@@ -9,29 +9,23 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
+from dotenv import load_dotenv
 from src.market_data import get_provider
 
 from src.alerts import append_alert_log, evaluate_alerts, load_alerts, save_alerts, scanner_can_trigger
+from src.data_provider import YahooProvider
 from src.options_engine import fetch_chain, price_call_debit_spread, price_long_option
 from src.options_greeks import greeks_from_price
 from src.options_scanner import build_call_debit_candidates, scan_ticker_for_calls
-from src.quant import (
-    backtest_sma_crossover,
-    calibration_report,
-    dte_from_expiry as trading_dte,
-    get_clean_prices,
-    get_terminal_distribution,
-    momentum_research,
-    prob_above,
-    simulate_paths_bootstrap,
-    simulate_paths_regime,
-    sma_research,
-    terminal_percentiles,
-    walk_forward_research,
-    walk_forward_eval,
-)
+from src.quant import dte_from_expiry as trading_dte, get_terminal_distribution
+from src.quant_backtest import momentum_signal, run_backtest, sma_crossover_signal, walk_forward_eval
+from src.quant_forecast import prob_above, simulate_bootstrap, simulate_regime_bootstrap, terminal_percentiles
+from src.quant_validation import calibration_report, coverage_summary, drawdown_curve, realized_volatility, returns_distribution
+from src.factor_regression import run_factor_regression
+from src.ai_assistant import build_snapshot_payload, run_ai_assistant
 
 st.set_page_config(page_title="Jake's Investment Dashboard", layout="wide")
+load_dotenv()
 
 st.title("Investment Dashboard")
 st.caption("Local-only MVP: watchlist, charts, portfolio PnL. Not financial advice.")
@@ -90,6 +84,61 @@ def get_prices(tickers_list, start_date, end_date):
     return provider.get_prices(tickers_list, start_date, end_date)
 
 
+quant_provider = YahooProvider()
+
+
+@st.cache_data(ttl=600)
+def get_quant_series(ticker, start_date, end_date):
+    df = quant_provider.get_prices(ticker, start_date, end_date)
+    if df.empty:
+        return pd.Series(dtype=float)
+    col = ticker if ticker in df.columns else df.columns[0]
+    return df[col].dropna()
+
+
+@st.cache_data(ttl=600)
+def run_forecast(series, horizon_days, n_paths, model):
+    if model == "regime":
+        return simulate_regime_bootstrap(series, horizon_days, n_paths)
+    return simulate_bootstrap(series, horizon_days, n_paths)
+
+
+@st.cache_data(ttl=600)
+def run_calibration(series, horizon_days, lookback_days, n_paths, model):
+    return calibration_report(series, horizon_days, lookback_days, n_paths, model)
+
+@st.cache_data(ttl=600)
+def run_factors(asset, factors, start_date, end_date, min_obs):
+    return run_factor_regression(asset, factors, start_date, end_date, min_obs=min_obs)
+
+def build_ai_snapshot(watch_df, positions_df, range_label, factor_summary):
+    watch = watch_df.reset_index().rename(columns={"index": "ticker"})
+    watch = watch[["ticker", "Price", "Day Change ($)", "Day Change (%)", f"Return ({range_label}) %"]]
+    watch = watch.sort_values(by=f"Return ({range_label}) %", ascending=False)
+    top_watch = watch.head(8).to_dict(orient="records")
+    laggards = watch.tail(5).to_dict(orient="records")
+
+    positions = positions_df[[
+        "ticker",
+        "shares",
+        "cost_basis",
+        "last_price",
+        "market_value",
+        "pnl_$",
+        "pnl_%",
+        "weight_%",
+    ]].sort_values("weight_%", ascending=False)
+    positions = positions.head(12).to_dict(orient="records")
+
+    return {
+        "date": datetime.utcnow().strftime("%Y-%m-%d"),
+        "range_label": range_label,
+        "watchlist_top": top_watch,
+        "watchlist_laggards": laggards,
+        "portfolio": positions,
+        "factor_regression": factor_summary,
+    }
+
 def extract_close(downloaded, tickers_list):
     # yf.download returns different shapes depending on count of tickers
     if len(tickers_list) == 1:
@@ -124,6 +173,37 @@ def parse_positions(csv_text):
 
 def pct_change(series):
     return (series.iloc[-1] / series.iloc[0] - 1.0) * 100.0
+
+
+def build_positions_table(positions_csv_text, close_prices):
+    positions_df = parse_positions(positions_csv_text)
+    if positions_df.empty:
+        for col in ["last_price", "market_value", "cost_value", "pnl_$", "pnl_%", "weight_%"]:
+            positions_df[col] = pd.Series(dtype=float)
+        return positions_df, close_prices
+
+    pos_tickers = positions_df["ticker"].unique().tolist()
+    missing = [t for t in pos_tickers if t not in close_prices.columns]
+
+    if missing:
+        raw2 = get_prices(missing, start, end)
+        close2 = extract_close(raw2, missing)
+        close_prices = close_prices.join(close2, how="outer")
+
+    last_prices = close_prices.ffill().iloc[-1]
+    positions_df["last_price"] = positions_df["ticker"].map(last_prices.to_dict())
+    positions_df["market_value"] = positions_df["shares"] * positions_df["last_price"]
+    positions_df["cost_value"] = positions_df["shares"] * positions_df["cost_basis"]
+    positions_df["pnl_$"] = positions_df["market_value"] - positions_df["cost_value"]
+    positions_df["pnl_%"] = (positions_df["pnl_$"] / positions_df["cost_value"]) * 100
+
+    total_mv = positions_df["market_value"].sum()
+    if total_mv > 0:
+        positions_df["weight_%"] = (positions_df["market_value"] / total_mv) * 100
+    else:
+        positions_df["weight_%"] = 0.0
+
+    return positions_df, close_prices
 
 
 def load_csv_with_columns(path, columns):
@@ -217,6 +297,9 @@ with c2:
 
 st.divider()
 
+# Build positions snapshot for AI/portfolio sections
+positions_table, close = build_positions_table(positions_csv, close)
+
 # -----------------------------
 # Tabs: Alerts / Quant / Options
 # -----------------------------
@@ -293,67 +376,154 @@ with alerts_tab:
             st.caption("No triggered alerts yet.")
 
 with quant_tab:
-    forecast_tab, backtest_tab, research_tab = st.tabs(["Forecast", "Backtest Signals", "Strategy Research"])
+    st.subheader("Quant Toolkit")
+    qc1, qc2, qc3 = st.columns(3)
+    qticker = qc1.selectbox("Ticker", data_tickers, index=0, key="quant_ticker")
+    default_start = (datetime.today() - timedelta(days=365 * 5)).date()
+    qstart = qc2.date_input("Start date", value=default_start, key="quant_start")
+    qend = qc3.date_input("End date", value=datetime.today().date(), key="quant_end")
+
+    series = pd.Series(dtype=float)
+    if qstart >= qend:
+        st.warning("Start date must be earlier than end date.")
+    else:
+        series = get_quant_series(qticker, qstart, qend)
+        if series.empty:
+            st.warning("Not enough data for the selected range.")
+
+    forecast_tab, backtest_tab, validation_tab, factors_tab, ai_tab = st.tabs(
+        ["Forecast", "Backtest", "Validation", "Factors", "AI"]
+    )
 
     with forecast_tab:
-        st.subheader("Scenario Simulation")
-        qticker = st.selectbox("Ticker", data_tickers, index=0, key="quant_ticker")
-        horizon = st.selectbox("Horizon (trading days)", [5, 20, 60], index=1)
+        st.subheader("Forecast Cones (Distribution)")
+        horizon = st.selectbox("Horizon (trading days)", [5, 20, 60, 120], index=1)
         model = st.selectbox("Model", ["bootstrap", "regime"], index=0)
         n_paths = st.slider("Paths", min_value=2000, max_value=20000, step=1000, value=10000)
-        target = st.number_input("Target price", min_value=0.0, step=1.0, value=float(latest_prices.get(qticker, 0.0)))
+        last_price = float(series.iloc[-1]) if not series.empty else 0.0
+        target = st.number_input("Target price", min_value=0.0, step=1.0, value=last_price)
 
-        series = get_clean_prices(qticker, start, end)
         if series.empty:
-            st.warning("Not enough data to run simulation.")
+            st.caption("Load a ticker and date range to run forecasts.")
         else:
-            if model == "regime":
-                paths, terminal = simulate_paths_regime(series, int(horizon), int(n_paths))
-            else:
-                paths, terminal = simulate_paths_bootstrap(series, int(horizon), int(n_paths))
-
+            paths, terminal = run_forecast(series, int(horizon), int(n_paths), model)
             if terminal.size == 0:
                 st.warning("Not enough data to run simulation.")
             else:
                 percentiles = terminal_percentiles(terminal)
                 pct_df = pd.DataFrame({
                     "Percentile": list(percentiles.keys()),
-                    "Price": list(percentiles.values())
+                    "Price": list(percentiles.values()),
                 })
                 st.dataframe(pct_df, use_container_width=True)
 
                 prob_current = prob_above(terminal, float(series.iloc[-1]))
                 prob_target = prob_above(terminal, float(target))
 
-                st.metric("P(price > current)", f"{prob_current*100:.1f}%")
-                st.metric("P(price > target)", f"{prob_target*100:.1f}%")
+                st.metric("P(terminal > current)", f"{prob_current*100:.1f}%")
+                st.metric("P(terminal > target)", f"{prob_target*100:.1f}%")
 
-                st.caption("Fan chart (sample of paths)")
+                st.caption("Fan chart (percentile bands + sample paths)")
                 fig3 = plt.figure()
                 sample_paths = paths[:100]
                 plt.plot(sample_paths.T, color="steelblue", alpha=0.05)
                 pcts = np.percentile(paths, [5, 25, 50, 75, 95], axis=0)
                 for i, p in enumerate([5, 25, 50, 75, 95]):
                     plt.plot(pcts[i], label=f"P{p}")
-                plt.title(f"{qticker} Monte Carlo ({horizon}d)")
+                plt.title(f"{qticker} Forecast Cone ({horizon}d)")
                 plt.xlabel("Day")
                 plt.ylabel("Price")
                 plt.legend()
                 st.pyplot(fig3, clear_figure=True)
 
-        st.subheader("Calibration Report (20D horizon)")
-        with st.expander("Run calibration", expanded=False):
-            calib_model = st.selectbox("Model", ["bootstrap", "regime"], index=0, key="calib_model")
-            calib_paths = st.number_input("Paths per window", min_value=500, step=500, value=2000)
+    with backtest_tab:
+        st.subheader("Backtest (No Lookahead + Walk-forward)")
+        strategy = st.selectbox("Strategy", ["SMA Crossover", "Time-series Momentum"], index=0)
+        cost_bps = st.number_input("Transaction cost (bps)", min_value=0.0, step=1.0, value=5.0)
+        slippage_bps = st.number_input("Slippage (bps)", min_value=0.0, step=1.0, value=2.0)
+
+        params = {}
+        signal_fn = sma_crossover_signal
+        if strategy == "SMA Crossover":
+            fast = st.number_input("Fast SMA", min_value=5, step=5, value=50)
+            slow = st.number_input("Slow SMA", min_value=20, step=10, value=200)
+            params = {"fast": int(fast), "slow": int(slow)}
+            signal_fn = sma_crossover_signal
+        else:
+            lookback = st.number_input("Lookback (trading days)", min_value=20, step=10, value=252)
+            params = {"lookback": int(lookback)}
+            signal_fn = momentum_signal
+
+        train_days = st.number_input("Train days", min_value=252, step=126, value=756)
+        test_days = st.number_input("Test days", min_value=21, step=21, value=126)
+        step_days = st.number_input("Step days", min_value=21, step=21, value=126)
+
+        if series.empty:
+            st.caption("Load a ticker and date range to run backtests.")
+        else:
+            wf = walk_forward_eval(
+                series,
+                signal_fn,
+                int(train_days),
+                int(test_days),
+                int(step_days),
+                cost_bps=float(cost_bps),
+                slippage_bps=float(slippage_bps),
+                **params,
+            )
+
+            st.subheader("Segment Metrics")
+            if not wf.segment_metrics.empty:
+                st.dataframe(wf.segment_metrics, use_container_width=True, height=240)
+            else:
+                st.caption("Not enough history for walk-forward segments.")
+
+            st.subheader("Overall Metrics")
+            st.metric("CAGR", f"{wf.overall_metrics.get('cagr', 0.0)*100:.2f}%")
+            st.metric("Max Drawdown", f"{wf.overall_metrics.get('max_drawdown', 0.0)*100:.2f}%")
+            st.metric("Vol", f"{wf.overall_metrics.get('vol', 0.0)*100:.2f}%")
+            st.metric("Sharpe", f"{wf.overall_metrics.get('sharpe', 0.0):.2f}")
+            st.metric("Win Rate", f"{wf.overall_metrics.get('win_rate', 0.0)*100:.1f}%")
+            st.metric("Turnover", f"{wf.overall_metrics.get('turnover', 0.0):.2f}")
+            st.metric("Trades", f"{int(wf.overall_metrics.get('trades', 0))}")
+
+            st.subheader("Equity Curve (Walk-forward)")
+            if not wf.equity_curve.empty:
+                fig4 = plt.figure()
+                plt.plot(wf.equity_curve.index, wf.equity_curve.values)
+                plt.xlabel("Date")
+                plt.ylabel("Equity")
+                plt.title("Walk-forward Equity")
+                st.pyplot(fig4, clear_figure=True)
+
+            st.subheader("Full-period Backtest")
+            full = run_backtest(series, signal_fn, cost_bps=float(cost_bps), slippage_bps=float(slippage_bps), **params)
+            if not full.equity_curve.empty:
+                fig5 = plt.figure()
+                plt.plot(full.equity_curve.index, full.equity_curve.values)
+                plt.xlabel("Date")
+                plt.ylabel("Equity")
+                plt.title("Full-period Equity")
+                st.pyplot(fig5, clear_figure=True)
+
+    with validation_tab:
+        st.subheader("Calibration & Diagnostics")
+        calib_model = st.selectbox("Model", ["bootstrap", "regime"], index=0, key="calib_model")
+        horizon_days = st.selectbox("Horizon (trading days)", [5, 20, 60, 120], index=1, key="calib_horizon")
+        calib_paths = st.number_input("Paths per window", min_value=500, step=500, value=2000)
+        lookback_days = st.number_input("Lookback days", min_value=252, step=126, value=756)
+
+        if series.empty:
+            st.caption("Load a ticker and date range to run calibration.")
+        else:
             if st.button("Run calibration"):
-                calib = calibration_report(series, horizon_days=20, lookback_days=756, n_paths=int(calib_paths), method=calib_model)
+                calib = run_calibration(series, int(horizon_days), int(lookback_days), int(calib_paths), calib_model)
                 if calib.empty:
                     st.warning("Not enough history for calibration.")
                 else:
-                    cov_10_90 = calib["in_10_90"].mean()
-                    cov_5_95 = calib["in_5_95"].mean()
-                    st.metric("Coverage P10–P90", f"{cov_10_90*100:.1f}%")
-                    st.metric("Coverage P5–P95", f"{cov_5_95*100:.1f}%")
+                    cov = coverage_summary(calib)
+                    st.metric("Coverage 80% band (P10–P90)", f"{cov['cov_10_90']*100:.1f}%")
+                    st.metric("Coverage 90% band (P5–P95)", f"{cov['cov_5_95']*100:.1f}%")
 
                     figc = plt.figure()
                     plt.plot(calib["date"], calib["future"], label="Realized")
@@ -366,100 +536,159 @@ with quant_tab:
                     plt.ylabel("Price")
                     st.pyplot(figc, clear_figure=True)
 
-    with backtest_tab:
-        st.subheader("Walk-forward SMA Crossover")
-        bticker = st.selectbox("Ticker", data_tickers, index=0, key="bt_ticker")
-        train_days = st.number_input("Train days", min_value=252, step=126, value=756)
-        test_days = st.number_input("Test days", min_value=21, step=21, value=126)
-        step_days = st.number_input("Step days", min_value=21, step=21, value=126)
+                    figcov = plt.figure()
+                    cov_80 = calib["in_10_90"].rolling(20).mean()
+                    cov_90 = calib["in_5_95"].rolling(20).mean()
+                    plt.plot(calib["date"], cov_80, label="Rolling 20D coverage 80% band")
+                    plt.plot(calib["date"], cov_90, label="Rolling 20D coverage 90% band")
+                    plt.axhline(0.8, color="gray", linestyle="--", linewidth=1)
+                    plt.axhline(0.9, color="gray", linestyle=":", linewidth=1)
+                    plt.legend()
+                    plt.xlabel("Date")
+                    plt.ylabel("Coverage")
+                    st.pyplot(figcov, clear_figure=True)
 
-        series = get_clean_prices(bticker, start, end)
-        if series.empty:
-            st.warning("Not enough data to run backtest.")
-        else:
-            wf = walk_forward_eval(series, backtest_sma_crossover, int(train_days), int(test_days), int(step_days))
-
-            st.subheader("Segment Metrics")
-            if not wf.segment_metrics.empty:
-                st.dataframe(wf.segment_metrics, use_container_width=True, height=240)
-            else:
-                st.caption("Not enough history for walk-forward segments.")
-
-            st.subheader("Overall Metrics")
-            st.metric("CAGR", f"{wf.overall_metrics['cagr']*100:.2f}%")
-            st.metric("Max Drawdown", f"{wf.overall_metrics['max_drawdown']*100:.2f}%")
-            st.metric("Vol", f"{wf.overall_metrics['vol']*100:.2f}%")
-            st.metric("Sharpe", f"{wf.overall_metrics['sharpe']:.2f}")
-            st.metric("Win Rate", f"{wf.overall_metrics['win_rate']*100:.1f}%")
-            st.metric("Turnover", f"{wf.overall_metrics['turnover']:.2f}")
-
-            st.subheader("Equity Curve")
-            if not wf.equity_curve.empty:
-                fig4 = plt.figure()
-                plt.plot(wf.equity_curve.index, wf.equity_curve.values)
+            st.subheader("Diagnostics")
+            vol20 = realized_volatility(series, 20)
+            vol60 = realized_volatility(series, 60)
+            if not vol20.empty and not vol60.empty:
+                figv = plt.figure()
+                plt.plot(vol20.index, vol20.values, label="20D Vol")
+                plt.plot(vol60.index, vol60.values, label="60D Vol")
+                plt.legend()
                 plt.xlabel("Date")
-                plt.ylabel("Equity")
-                plt.title("Walk-forward Equity")
-                st.pyplot(fig4, clear_figure=True)
+                plt.ylabel("Vol (annualized)")
+                st.pyplot(figv, clear_figure=True)
 
-    with research_tab:
-        st.subheader("Strategy Research (vectorbt)")
-        rticker = st.selectbox("Ticker", data_tickers, index=0, key="research_ticker")
-        strategy = st.selectbox("Strategy", ["sma", "momentum"], index=0)
-        train_days = st.number_input("Train days", min_value=252, step=126, value=756, key="research_train")
-        test_days = st.number_input("Test days", min_value=21, step=21, value=126, key="research_test")
-        step_days = st.number_input("Step days", min_value=21, step=21, value=126, key="research_step")
+            rets, _ = returns_distribution(series)
+            if rets.size > 0:
+                figh = plt.figure()
+                plt.hist(rets, bins=50, color="steelblue", alpha=0.7)
+                plt.xlabel("Daily Return")
+                plt.ylabel("Frequency")
+                st.pyplot(figh, clear_figure=True)
 
-        series = get_clean_prices(rticker, start, end)
-        if series.empty:
-            st.warning("Not enough data for research.")
+            dd = drawdown_curve(series)
+            if not dd.empty:
+                figd = plt.figure()
+                plt.plot(dd.index, dd.values, color="firebrick")
+                plt.xlabel("Date")
+                plt.ylabel("Drawdown")
+                st.pyplot(figd, clear_figure=True)
+
+    with factors_tab:
+        st.subheader("Factor Regression (OLS)")
+        st.caption("Uses ETF factor proxies from Yahoo Finance. Beta/alpha are daily unless noted.")
+        fc1, fc2 = st.columns([1.2, 0.8])
+        factor_text = fc1.text_input(
+            "Factor tickers (comma-separated)",
+            value="SPY,QQQ,IWM,TLT,HYG,GLD",
+            key="factor_tickers",
+        )
+        min_obs = fc2.number_input("Min observations", min_value=30, step=10, value=60)
+
+        factor_list = [f.strip().upper() for f in factor_text.split(",") if f.strip()]
+        factor_list = [f for f in factor_list if f != qticker]
+
+        if not factor_list:
+            st.caption("Add at least one factor ticker (different from the asset ticker).")
+        elif qstart >= qend:
+            st.caption("Pick a valid date range to run the regression.")
         else:
-            if strategy == "sma":
-                fast_range = list(range(5, 55, 5))
-                slow_range = list(range(100, 301, 20))
-                if st.button("Run SMA sweep"):
-                    results = sma_research(series, fast_range, slow_range)
-                    top_sharpe = results.sort_values("sharpe", ascending=False).head(10)
-                    top_dd = results.sort_values("max_drawdown", ascending=True).head(10)
-                    st.subheader("Top by Sharpe")
-                    st.dataframe(top_sharpe, use_container_width=True, height=240)
-                    st.subheader("Top by Max Drawdown")
-                    st.dataframe(top_dd, use_container_width=True, height=240)
+            if st.button("Run factor regression"):
+                with st.spinner("Running factor regression..."):
+                    result = run_factors(qticker, tuple(factor_list), qstart, qend, int(min_obs))
+                if result is None:
+                    st.warning("Not enough data to run the regression. Try a longer date range.")
+                else:
+                    metrics = result.metrics
+                    st.session_state["factor_summary"] = {
+                        "asset": qticker,
+                        "factors": factor_list,
+                        "metrics": metrics,
+                        "coefficients": result.coefficients.reset_index().rename(
+                            columns={"index": "factor"}
+                        ).to_dict(orient="records"),
+                    }
+                    mc1, mc2, mc3, mc4 = st.columns(4)
+                    mc1.metric("R²", f"{metrics.get('r2', 0.0):.3f}")
+                    mc2.metric("Adj R²", f"{metrics.get('adj_r2', 0.0):.3f}")
+                    mc3.metric("Alpha (annual)", f"{metrics.get('alpha_annual', 0.0)*100:.2f}%")
+                    mc4.metric("Info Ratio", f"{metrics.get('info_ratio', 0.0):.2f}")
 
-                    seg_df, best_df = walk_forward_research(
-                        series, "sma", {"fast": fast_range, "slow": slow_range}, int(train_days), int(test_days), int(step_days)
+                    coeffs = result.coefficients.copy()
+                    if "const" in coeffs.index:
+                        coeffs = coeffs.rename(index={"const": "alpha"})
+                    st.subheader("Coefficients")
+                    st.dataframe(
+                        coeffs.style.format({"coef": "{:.4f}", "t_stat": "{:.2f}", "p_value": "{:.4f}"}),
+                        use_container_width=True,
+                        height=240,
                     )
-                    st.subheader("Walk-forward segments")
-                    if not seg_df.empty:
-                        st.dataframe(seg_df, use_container_width=True, height=240)
-                    else:
-                        st.caption("Not enough data for walk-forward.")
-                    st.subheader("Best params by segment")
-                    if not best_df.empty:
-                        st.dataframe(best_df, use_container_width=True, height=240)
 
+                    st.subheader("Actual vs Fitted (Cumulative)")
+                    data = result.data.copy()
+                    if not data.empty:
+                        actual = (1 + data["asset"]).cumprod()
+                        fitted = (1 + data["fitted"]).cumprod()
+                        fig = plt.figure()
+                        plt.plot(actual.index, actual.values, label="Actual")
+                        plt.plot(fitted.index, fitted.values, label="Fitted", linestyle="--")
+                        plt.legend()
+                        plt.xlabel("Date")
+                        plt.ylabel("Growth of $1")
+                        st.pyplot(fig, clear_figure=True)
+
+    with ai_tab:
+        st.subheader("AI Decision Support")
+        st.caption("Summarizes dashboard data and highlights risks. Not financial advice.")
+
+        if "factor_summary" not in st.session_state:
+            st.session_state["factor_summary"] = {}
+
+        if not os.getenv("OPENAI_API_KEY"):
+            st.warning("Set OPENAI_API_KEY in your environment to enable the AI assistant.")
+
+        ac1, ac2, ac3 = st.columns([1.2, 1.1, 1.2])
+        mode = ac1.selectbox("Mode", ["Digest + Recommendations", "Q&A"], index=0)
+        quality = ac2.selectbox("Quality", ["Fast", "Deep"], index=0)
+        include_web = ac3.checkbox("Include live market/news (web search)", value=False)
+
+        model_map = {
+            "Fast": "gpt-4.1-mini",
+            "Deep": "gpt-4.1",
+            "Fast_web": "gpt-4o-mini",
+            "Deep_web": "gpt-4o",
+        }
+        if include_web:
+            model = model_map.get(f"{quality}_web", "gpt-4o-mini")
+        else:
+            model = model_map.get(quality, "gpt-4.1-mini")
+
+        if mode == "Q&A":
+            question = st.text_area(
+                "Ask a question about your data",
+                value="What are the biggest risks in my portfolio right now?",
+                height=100,
+            )
+            run_label = "Ask AI"
+        else:
+            question = st.text_area(
+                "Optional focus (leave blank for full digest)",
+                value="Summarize the watchlist and portfolio, then suggest risk controls.",
+                height=100,
+            )
+            run_label = "Generate digest"
+
+        if st.button(run_label):
+            snapshot = build_ai_snapshot(watch_df, positions_table, range_label, st.session_state["factor_summary"])
+            payload = build_snapshot_payload(snapshot, question)
+            with st.spinner("Thinking..."):
+                text, err = run_ai_assistant(payload, model=model, include_web=include_web)
+            if err:
+                st.error(err)
             else:
-                lookbacks = list(range(5, 65, 5))
-                if st.button("Run Momentum sweep"):
-                    results = momentum_research(series, lookbacks)
-                    top_sharpe = results.sort_values("sharpe", ascending=False).head(10)
-                    top_dd = results.sort_values("max_drawdown", ascending=True).head(10)
-                    st.subheader("Top by Sharpe")
-                    st.dataframe(top_sharpe, use_container_width=True, height=240)
-                    st.subheader("Top by Max Drawdown")
-                    st.dataframe(top_dd, use_container_width=True, height=240)
-
-                    seg_df, best_df = walk_forward_research(
-                        series, "momentum", {"lookback": lookbacks}, int(train_days), int(test_days), int(step_days)
-                    )
-                    st.subheader("Walk-forward segments")
-                    if not seg_df.empty:
-                        st.dataframe(seg_df, use_container_width=True, height=240)
-                    else:
-                        st.caption("Not enough data for walk-forward.")
-                    st.subheader("Best params by segment")
-                    if not best_df.empty:
-                        st.dataframe(best_df, use_container_width=True, height=240)
+                st.markdown(text)
 
 with options_tab:
     risk_free_rate = st.number_input("Risk-free rate", min_value=0.0, max_value=0.20, value=0.04, step=0.005)
@@ -872,34 +1101,14 @@ with options_tab:
 # -----------------------------
 # Portfolio Section
 # -----------------------------
-positions = parse_positions(positions_csv)
+positions = positions_table.copy()
 
 st.subheader("Portfolio (manual positions)")
 if positions.empty:
     st.info("Add positions in the sidebar to see portfolio PnL and allocation.")
     st.stop()
 
-# Ensure we have prices for all position tickers (add missing tickers)
-pos_tickers = positions["ticker"].unique().tolist()
-missing = [t for t in pos_tickers if t not in close.columns]
-
-if missing:
-    # Pull missing tickers and merge
-    raw2 = get_prices(missing, start, end)
-    close2 = extract_close(raw2, missing)
-    close = close.join(close2, how="outer")
-
-# Latest available prices for each ticker (handle NaNs)
-last_prices = close.ffill().iloc[-1]
-
-positions["last_price"] = positions["ticker"].map(last_prices.to_dict())
-positions["market_value"] = positions["shares"] * positions["last_price"]
-positions["cost_value"] = positions["shares"] * positions["cost_basis"]
-positions["pnl_$"] = positions["market_value"] - positions["cost_value"]
-positions["pnl_%"] = (positions["pnl_$"] / positions["cost_value"]) * 100
-
 total_mv = positions["market_value"].sum()
-positions["weight_%"] = (positions["market_value"] / total_mv) * 100
 
 p1, p2 = st.columns([1.2, 0.8], gap="large")
 
