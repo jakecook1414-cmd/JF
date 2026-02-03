@@ -509,6 +509,46 @@ with quant_tab:
         s1.metric("1D return", f"{ret_1d*100:.2f}%")
         s2.metric("5D return", f"{ret_5d*100:.2f}%")
         s3.metric("20D vol (ann.)", f"{vol20_last*100:.1f}%")
+
+    st.subheader("Daily Decision Brief")
+    brief_cols = st.columns([1.1, 1.1, 0.8], gap="large")
+    with brief_cols[0]:
+        st.caption("Top movers (day)")
+        movers = watch_df.sort_values("Day Change (%)", ascending=False).head(3)
+        st.dataframe(
+            movers[["Price", "Day Change (%)"]].style.format({"Price": "{:.2f}", "Day Change (%)": "{:.2f}"}),
+            use_container_width=True,
+            height=140,
+        )
+    with brief_cols[1]:
+        st.caption("Laggards (day)")
+        laggards = watch_df.sort_values("Day Change (%)", ascending=True).head(3)
+        st.dataframe(
+            laggards[["Price", "Day Change (%)"]].style.format({"Price": "{:.2f}", "Day Change (%)": "{:.2f}"}),
+            use_container_width=True,
+            height=140,
+        )
+    with brief_cols[2]:
+        st.caption("Risk flags")
+        flags = []
+        if not positions_table.empty:
+            max_weight = float(positions_table["weight_%"].max())
+            if max_weight >= 35:
+                flags.append(f"High concentration ({max_weight:.1f}%)")
+            else:
+                flags.append(f"Top weight: {max_weight:.1f}%")
+        if not series.empty:
+            if vol20_last >= 0.45:
+                flags.append(f"High vol (20D {vol20_last*100:.1f}%)")
+        if st.session_state.get("last_forecast_summary"):
+            fsum = st.session_state["last_forecast_summary"]
+            flags.append(
+                f"Forecast P25–P75: {fsum['p25']:.2f}–{fsum['p75']:.2f} (vs {fsum['current']:.2f})"
+            )
+        if not flags:
+            flags = ["No active risk flags"]
+        for f in flags[:4]:
+            st.write(f"- {f}")
     st.caption("Use the tabs below or follow the guided flow based on your selected question.")
     intent_map = {
         "What could the price be by X date? (Forecast)": "Forecast",
@@ -580,6 +620,12 @@ with quant_tab:
                     "Percentile": ["P5", "P10", "P25", "P50", "P75", "P90", "P95"],
                     "Price": [p5, p10, p25, p50, p75, p90, p95],
                 })
+                st.session_state["last_forecast_summary"] = {
+                    "p25": p25,
+                    "p75": p75,
+                    "current": float(series.iloc[-1]),
+                    "horizon": int(horizon),
+                }
 
                 c1, c2, c3 = st.columns(3)
                 c1.metric("Expected range (P25–P75)", f"{p25:.2f} – {p75:.2f}")
