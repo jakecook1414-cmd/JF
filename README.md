@@ -22,6 +22,7 @@ Open the **Quant** tab in the Streamlit app for the professional-grade quant sui
 - Beginner / Advanced mode toggle
 - Presets for Forecast and Backtest to reduce setup time
 - Always-visible assumptions & limitations block
+- Daily summary card + CSV downloads for key outputs
 
 **Forecast**
 - Calendar-date fan chart (P10/P50/P90)

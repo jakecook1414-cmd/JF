@@ -4,6 +4,7 @@ import subprocess
 import sys
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -26,6 +27,8 @@ from src.ai_assistant import build_snapshot_payload, run_ai_assistant
 
 st.set_page_config(page_title="Jake's Investment Dashboard", layout="wide")
 load_dotenv()
+
+DATA_DIR = Path("data")
 
 st.title("Investment Dashboard")
 st.caption("Local-only MVP: watchlist, charts, portfolio PnL. Not financial advice.")
@@ -123,6 +126,8 @@ METRIC_HELP = {
     "coverage_90": "Coverage (90% band): how often realized prices fell within the 90% forecast band.",
     "alpha": "Alpha: return not explained by factors. Positive is good, but not guaranteed.",
     "r2": "R²: fraction of returns explained by the factors. Higher means more explained.",
+    "adj_r2": "Adj R²: R² adjusted for number of factors. Higher means better fit per factor.",
+    "info_ratio": "Info ratio: alpha relative to tracking error. Higher is better.",
 }
 
 
@@ -236,6 +241,10 @@ def pct_change(series):
     return (series.iloc[-1] / series.iloc[0] - 1.0) * 100.0
 
 
+def data_path(filename: str) -> str:
+    return str(DATA_DIR / filename)
+
+
 def build_positions_table(positions_csv_text, close_prices):
     positions_df = parse_positions(positions_csv_text)
     if positions_df.empty:
@@ -290,7 +299,7 @@ if not tickers:
     st.warning("Add at least one ticker to the watchlist.")
     st.stop()
 
-alerts_path = os.path.join("data", "alerts.json")
+alerts_path = data_path("alerts.json")
 alerts = load_alerts(alerts_path)
 alert_tickers = sorted({str(a.get("ticker", "")).upper() for a in alerts if a.get("ticker")})
 data_tickers = sorted(set(tickers) | set(alert_tickers))
@@ -317,7 +326,7 @@ day_pct_moves = day_pct_moves.to_dict()
 now_utc = datetime.now(timezone.utc)
 alerts, triggered_events = evaluate_alerts(alerts, latest_prices, day_pct_moves, now_utc)
 save_alerts(alerts, alerts_path)
-append_alert_log(triggered_events, os.path.join("data", "alerts_log.csv"))
+append_alert_log(triggered_events, data_path("alerts_log.csv"))
 
 watch_df = pd.DataFrame({
     "Price": latest,
@@ -425,7 +434,7 @@ with alerts_tab:
                 st.rerun()
 
         st.markdown("**Triggered alerts feed**")
-        log_path = os.path.join("data", "alerts_log.csv")
+        log_path = data_path("alerts_log.csv")
         if os.path.exists(log_path):
             log_df = pd.read_csv(log_path)
             if not log_df.empty:
@@ -449,6 +458,24 @@ with quant_tab:
         horizontal=False,
     )
     beginner_mode = st.toggle("Beginner mode", value=True)
+    if st.button("Reset quant inputs"):
+        for k in [
+            "forecast_preset",
+            "forecast_horizon",
+            "forecast_paths",
+            "forecast_model",
+            "backtest_preset",
+            "bt_strategy",
+            "bt_fast",
+            "bt_slow",
+            "bt_lookback",
+            "calib_model",
+            "calib_horizon",
+            "factor_tickers",
+        ]:
+            if k in st.session_state:
+                del st.session_state[k]
+        st.rerun()
 
     st.info(
         "Assumptions & limitations\n"
@@ -473,6 +500,15 @@ with quant_tab:
         if series.empty:
             st.warning("Not enough data for the selected range.")
 
+    if not series.empty:
+        ret_1d = float(series.pct_change().iloc[-1])
+        ret_5d = float(series.pct_change(5).iloc[-1]) if len(series) > 5 else 0.0
+        vol20 = realized_volatility(series, 20)
+        vol20_last = float(vol20.iloc[-1]) if not vol20.empty else 0.0
+        s1, s2, s3 = st.columns(3)
+        s1.metric("1D return", f"{ret_1d*100:.2f}%")
+        s2.metric("5D return", f"{ret_5d*100:.2f}%")
+        s3.metric("20D vol (ann.)", f"{vol20_last*100:.1f}%")
     st.caption("Use the tabs below or follow the guided flow based on your selected question.")
     intent_map = {
         "What could the price be by X date? (Forecast)": "Forecast",
@@ -540,6 +576,10 @@ with quant_tab:
                 p90 = float(np.percentile(terminal, 90))
                 p5 = percentiles.get(5, 0.0)
                 p95 = percentiles.get(95, 0.0)
+                pct_df = pd.DataFrame({
+                    "Percentile": ["P5", "P10", "P25", "P50", "P75", "P90", "P95"],
+                    "Price": [p5, p10, p25, p50, p75, p90, p95],
+                })
 
                 c1, c2, c3 = st.columns(3)
                 c1.metric("Expected range (P25–P75)", f"{p25:.2f} – {p75:.2f}")
@@ -581,6 +621,13 @@ with quant_tab:
                 plt.xlabel("Terminal price")
                 plt.ylabel("Frequency")
                 st.pyplot(figh, clear_figure=True)
+
+                st.download_button(
+                    "Download percentiles CSV",
+                    pct_df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"{qticker}_forecast_percentiles.csv",
+                    mime="text/csv",
+                )
 
     with backtest_tab:
         st.subheader("Backtest: Would this strategy have worked historically?")
@@ -672,6 +719,11 @@ with quant_tab:
                 fig4 = plt.figure()
                 plt.plot(full.equity_curve.index, full.equity_curve.values, label="Strategy")
                 plt.plot(bench_equity.index, bench_equity.values, label="Buy & Hold", linestyle="--")
+                if "SPY" in data_tickers and qticker != "SPY":
+                    spy_series = get_quant_series("SPY", qstart, qend)
+                    if not spy_series.empty:
+                        spy_equity = (1 + spy_series.pct_change().fillna(0)).cumprod()
+                        plt.plot(spy_equity.index, spy_equity.values, label="SPY", linestyle=":")
                 plt.xlabel("Date")
                 plt.ylabel("Equity")
                 plt.legend()
@@ -685,16 +737,40 @@ with quant_tab:
                 bcols[2].metric("Vol", f"{bench_metrics.get('vol', 0.0)*100:.2f}%")
                 bcols[3].metric("Sharpe", f"{bench_metrics.get('sharpe', 0.0):.2f}")
 
+                eq_df = pd.DataFrame({
+                    "date": full.equity_curve.index,
+                    "strategy_equity": full.equity_curve.values,
+                    "buy_hold_equity": bench_equity.values,
+                })
+                st.download_button(
+                    "Download equity curve CSV",
+                    eq_df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"{qticker}_equity_curve.csv",
+                    mime="text/csv",
+                )
+
             if beginner_mode:
                 with st.expander("Detailed walk-forward segments", expanded=False):
                     if not wf.segment_metrics.empty:
                         st.dataframe(wf.segment_metrics, use_container_width=True, height=240)
+                        st.download_button(
+                            "Download walk-forward segments CSV",
+                            wf.segment_metrics.to_csv(index=False).encode("utf-8"),
+                            file_name=f"{qticker}_walkforward_segments.csv",
+                            mime="text/csv",
+                        )
                     else:
                         st.caption("Not enough history for walk-forward segments.")
             else:
                 st.subheader("Segment Metrics")
                 if not wf.segment_metrics.empty:
                     st.dataframe(wf.segment_metrics, use_container_width=True, height=240)
+                    st.download_button(
+                        "Download walk-forward segments CSV",
+                        wf.segment_metrics.to_csv(index=False).encode("utf-8"),
+                        file_name=f"{qticker}_walkforward_segments.csv",
+                        mime="text/csv",
+                    )
                 else:
                     st.caption("Not enough history for walk-forward segments.")
 
@@ -837,11 +913,11 @@ with quant_tab:
                     with mc1:
                         metric_with_help("R²", f"{metrics.get('r2', 0.0):.3f}", "r2")
                     with mc2:
-                        st.metric("Adj R²", f"{metrics.get('adj_r2', 0.0):.3f}")
+                        metric_with_help("Adj R²", f"{metrics.get('adj_r2', 0.0):.3f}", "adj_r2")
                     with mc3:
                         metric_with_help("Alpha (annual)", f"{metrics.get('alpha_annual', 0.0)*100:.2f}%", "alpha")
                     with mc4:
-                        st.metric("Info Ratio", f"{metrics.get('info_ratio', 0.0):.2f}")
+                        metric_with_help("Info Ratio", f"{metrics.get('info_ratio', 0.0):.2f}", "info_ratio")
 
                     coeffs = result.coefficients.copy()
                     if "const" in coeffs.index:
@@ -865,12 +941,24 @@ with quant_tab:
                                 use_container_width=True,
                                 height=240,
                             )
+                            st.download_button(
+                                "Download coefficients CSV",
+                                coeffs.reset_index().to_csv(index=False).encode("utf-8"),
+                                file_name=f"{qticker}_factor_coefficients.csv",
+                                mime="text/csv",
+                            )
                     else:
                         st.subheader("Coefficients")
                         st.dataframe(
                             coeffs.style.format({"coef": "{:.4f}", "t_stat": "{:.2f}", "p_value": "{:.4f}"}),
                             use_container_width=True,
                             height=240,
+                        )
+                        st.download_button(
+                            "Download coefficients CSV",
+                            coeffs.reset_index().to_csv(index=False).encode("utf-8"),
+                            file_name=f"{qticker}_factor_coefficients.csv",
+                            mime="text/csv",
                         )
 
                     st.subheader("Actual vs Fitted (Cumulative)")
@@ -943,7 +1031,7 @@ with options_tab:
 
     with spreads_tab:
         st.subheader("Call Debit Spreads")
-        spreads_path = os.path.join("data", "options_spreads.csv")
+        spreads_path = data_path("options_spreads.csv")
         spread_cols = [
             "position_id", "ticker", "expiry", "contracts", "entry_debit", "open_date",
             "notes", "long_strike", "short_strike"
@@ -1054,7 +1142,7 @@ with options_tab:
 
     with longs_tab:
         st.subheader("Long Calls / Puts")
-        longs_path = os.path.join("data", "options_longs.csv")
+        longs_path = data_path("options_longs.csv")
         long_cols = [
             "position_id", "ticker", "type", "expiry", "strike", "contracts",
             "entry_price", "open_date", "notes"
@@ -1217,7 +1305,7 @@ with options_tab:
                 cand_df = pd.DataFrame(candidate_rows).sort_values("score", ascending=False)
                 st.subheader("Top call debit spread candidates")
                 st.dataframe(cand_df, use_container_width=True, height=240)
-                cand_path = os.path.join("data", "options_scanner_candidates.csv")
+                cand_path = data_path("options_scanner_candidates.csv")
                 cand_df.to_csv(cand_path, index=False)
                 st.download_button(
                     "Download candidates CSV",
@@ -1244,14 +1332,14 @@ with options_tab:
                         "message": f"{c['ticker']} {c['expiry']} score {c['score']:.1f}",
                         "details_json": json.dumps(c),
                     })
-                append_alert_log(log_events, os.path.join("data", "alerts_log.csv"))
+                append_alert_log(log_events, data_path("alerts_log.csv"))
 
     with gains_tab:
         st.subheader("Potential Gains (Scenario + Expiry Payoff)")
         st.caption("Uses quant terminal distribution for scenario P/L percentiles.")
 
-        spreads_path = os.path.join("data", "options_spreads.csv")
-        longs_path = os.path.join("data", "options_longs.csv")
+        spreads_path = data_path("options_spreads.csv")
+        longs_path = data_path("options_longs.csv")
         spreads_df = load_csv_with_columns(spreads_path, spread_cols)
         longs_df = load_csv_with_columns(longs_path, long_cols)
 
